@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
@@ -23,11 +24,12 @@ MANAGED_PROFILE_DIR = Path.home() / ".bb-browser" / "browser" / "user-data"
 REQUIRED_ADAPTERS = {
     "twitter/search",
     "xiaohongshu/search",
-    "xiaohongshu/note",
-    "xiaohongshu/comments",
 }
 
 _LAST_SITE_CALL = 0.0
+XHS_READ_TIMEOUT_S = 25.0
+XHS_POLL_INTERVAL_S = 0.5
+XHS_EVAL_TIMEOUT_S = 10.0
 
 
 
@@ -64,13 +66,13 @@ def _error_code(message: str, hint: str = "") -> tuple[str, bool]:
         return "LOGIN_REQUIRED", True
     if "adapter" in combined and "not found" in combined:
         return "ADAPTER_NOT_INSTALLED", False
+    if "timeout" in combined or "timed out" in combined:
+        return "TIMEOUT", False
     if any(token in combined for token in (
         "no page target", "not connected", "daemon", "did not start",
         "cannot find a chromium", "browser",
     )):
         return "BROWSER_UNAVAILABLE", False
-    if "timeout" in combined:
-        return "TIMEOUT", False
     return "BB_BROWSER_ERROR", False
 
 
@@ -277,18 +279,106 @@ def xiaohongshu_search(keyword: str, sort: str = "general", limit: int = 10) -> 
     return result
 
 
-def xiaohongshu_note(note_id_or_url: str) -> dict[str, Any]:
+def _read_error(code: str, message: str) -> dict[str, Any]:
+    return {
+        "ok": False, "error_code": code, "message": message,
+        "requires_manual_login": code == "LOGIN_REQUIRED",
+    }
+
+
+def _note_id(value: str) -> str | None:
+    if re.fullmatch(r"[a-fA-F0-9]{24}", value):
+        return value.lower()
+    try:
+        parsed = urlparse(value)
+        if (parsed.scheme != "https" or
+                parsed.hostname not in {"www.xiaohongshu.com", "xiaohongshu.com"} or
+                parsed.username is not None or parsed.password is not None or
+                parsed.port not in (None, 443)):
+            return None
+        match = re.fullmatch(r"/(?:explore|search_result)/([a-fA-F0-9]{24})/?", parsed.path)
+        return match.group(1).lower() if match else None
+    except ValueError:
+        return None
+
+
+def _read_xiaohongshu(note_id_or_url: str, mode: str) -> dict[str, Any]:
+    """Run short page steps; all waiting uses the host's monotonic clock.
+
+    Background Chrome tabs can defer page setTimeout callbacks beyond the
+    bb-browser daemon's 30s limit. Never await a page-side polling loop here.
+    """
     value = str(note_id_or_url or "").strip()
-    if not value:
-        return {"ok": False, "error_code": "INVALID_ARGUMENT", "message": "note_id_or_url is required"}
-    return _site_call("xiaohongshu/note", [value], timeout_s=90.0)
+    expected_id = _note_id(value)
+    if expected_id is None or mode not in {"note", "comments"}:
+        return _read_error("INVALID_ARGUMENT", "Pass a 24-character note ID or a full https://www.xiaohongshu.com/explore/... URL")
+    try:
+        template = (SERVER_DIR / "xiaohongshu_read.js").read_text(encoding="utf-8")
+        if template.count("__BB_READ_REQUEST__") != 1:
+            raise ValueError("Invalid bundled reader template")
+    except (OSError, ValueError):
+        return _read_error("READER_NOT_INSTALLED", "The bundled xiaohongshu_read.js is missing or invalid; restore the complete MCP package")
+
+    deadline = time.monotonic() + XHS_READ_TIMEOUT_S
+    phase = "start"
+    tab_id = None
+    stage = "page_not_ready"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _read_error("TIMEOUT", f"Xiaohongshu {mode} was not ready within {XHS_READ_TIMEOUT_S:g}s (stage: {stage})")
+        request = {"mode": mode, "phase": phase, "note_id_or_url": value}
+        expression = template.replace("__BB_READ_REQUEST__", json.dumps(request, ensure_ascii=True))
+        target = ["--tab", tab_id] if tab_id else ["--domain", "www.xiaohongshu.com"]
+        result = _run_bb(["eval", expression, *target, "--json"], timeout_s=min(XHS_EVAL_TIMEOUT_S, remaining))
+        if not result.get("ok"):
+            return result
+        envelope = result.get("data")
+        if not isinstance(envelope, dict) or envelope.get("error") or "result" not in envelope:
+            return _read_error("INVALID_BB_BROWSER_OUTPUT", "bb-browser did not return a page evaluation result")
+        returned_tab = envelope.get("tab")
+        if not isinstance(returned_tab, str) or not returned_tab or (tab_id and returned_tab != tab_id):
+            return _read_error("BROWSER_UNAVAILABLE", "The selected Xiaohongshu tab was lost or changed during the read")
+        tab_id = returned_tab
+        payload = envelope["result"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                payload = None
+        if not isinstance(payload, dict):
+            return _read_error("INVALID_BB_BROWSER_OUTPUT", "The page reader did not return a structured result")
+        status = payload.get("status")
+        if status == "error" or payload.get("error"):
+            message = str(payload.get("message") or payload.get("error") or "Xiaohongshu read failed")
+            code = str(payload.get("error_code") or _error_code(message)[0])
+            return _read_error(code, message)
+        if status == "ready":
+            data = payload.get("data")
+            valid = isinstance(data, dict) and data.get("note_id") == expected_id
+            if mode == "note":
+                valid = valid and isinstance(data.get("desc"), str) and isinstance(data.get("images"), list)
+            else:
+                valid = valid and isinstance(data.get("comments"), list)
+            if not valid:
+                return _read_error("INVALID_BB_BROWSER_OUTPUT", "The page returned incomplete data or a different note")
+            return {"ok": True, "error_code": None, "data": data, "requires_manual_login": False}
+        if status != "pending":
+            return _read_error("INVALID_BB_BROWSER_OUTPUT", "Unexpected page reader state")
+        stage = str(payload.get("stage") or "note_loading")
+        if payload.get("started") is not False:
+            phase = "poll"
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(XHS_POLL_INTERVAL_S, remaining))
+
+
+def xiaohongshu_note(note_id_or_url: str) -> dict[str, Any]:
+    return _read_xiaohongshu(note_id_or_url, "note")
 
 
 def xiaohongshu_comments(note_id_or_url: str) -> dict[str, Any]:
-    value = str(note_id_or_url or "").strip()
-    if not value:
-        return {"ok": False, "error_code": "INVALID_ARGUMENT", "message": "note_id_or_url is required"}
-    return _site_call("xiaohongshu/comments", [value], timeout_s=90.0)
+    return _read_xiaohongshu(note_id_or_url, "comments")
 
 
 def open_login_page(site: str) -> dict[str, Any]:

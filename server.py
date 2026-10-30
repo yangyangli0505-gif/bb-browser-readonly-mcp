@@ -29,7 +29,7 @@ server = MCPServer(
         "inside the selected Chrome profile. Never claim login or retrieval succeeded when "
         "a tool returns LOGIN_REQUIRED or BROWSER_NOT_READY."
     ),
-    version="0.1.0",
+    version="0.1.1",
 )
 
 READ_ONLY = ToolAnnotations(
